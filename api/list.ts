@@ -2,56 +2,27 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const DREAMLO_PUBLIC = process.env.DREAMLO_PUBLIC_CODE as string;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const CACHE_TTL_MS = Number(process.env.LIST_CACHE_TTL_MS || 30_000);
 
-// Cache + throttling (in-memory per server instance)
-let lastPayload: any | null = null;
-let lastOkAt = 0;
-let inflight: Promise<any> | null = null;
-let lastFetchStarted = 0;
-const COOLDOWN_MS = 1500; // Dreamlo tolererar inte samma request inom ~1s
+type Cache = { ts: number; payload: any };
+let cache: Cache | null = null;
 
-function payloadFromDreamlo(json: any) {
-  const entries = json?.dreamlo?.leaderboard?.entry ?? [];
-  return {
-    updatedAt: new Date().toISOString(),
-    entries: entries.map((e: any) => ({
-      name: e.name,
-      score: Number(e.score),
-      seconds: Number(e.seconds ?? 0),
-      date: e.date,
-      text: e.text,
-    })),
-  };
-}
+async function fetchDreamloJSON(): Promise<any> {
+  if (!DREAMLO_PUBLIC) throw new Error("DREAMLO_PUBLIC_CODE missing");
+  const url = `http://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`; // HTTP med flit
+  const headers = { "User-Agent": "FastTap-Proxy/1.0" };
 
-async function fetchDreamlo() {
-  try {
-    // Cooldown: vänta om senaste start var nyss
-    const now = Date.now();
-    const wait = Math.max(0, COOLDOWN_MS - (now - lastFetchStarted));
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    lastFetchStarted = Date.now();
-
-    // Försök HTTPS, annars HTTP (vissa leaderboards har ej SSL)
-    const httpsUrl = `https://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`;
-    let r = await fetch(httpsUrl, { headers: { "User-Agent": "FastTap-Proxy/1.0" } });
-    let txt = await r.text();
-    let json: any;
+  // två försök, kort paus emellan
+  for (let i = 0; i < 2; i++) {
     try {
-      json = JSON.parse(txt);
-    } catch {
-      const httpUrl = `http://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`;
-      r = await fetch(httpUrl, { headers: { "User-Agent": "FastTap-Proxy/1.0" } });
-      txt = await r.text();
-      json = JSON.parse(txt);
+      const r = await fetch(url, { headers });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Upstream ${r.status}: ${text}`);
+      return JSON.parse(text);
+    } catch (e) {
+      if (i === 0) await new Promise((res) => setTimeout(res, 250));
+      else throw e;
     }
-
-    const payload = payloadFromDreamlo(json);
-    lastPayload = payload;
-    lastOkAt = Date.now();
-    return { ok: true, payload };
-  } catch (e: any) {
-    return { ok: false, msg: String(e?.message || e) };
   }
 }
 
@@ -62,28 +33,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method Not Allowed" });
-  if (!DREAMLO_PUBLIC) return res.status(200).json({ error: "Server not configured", entries: [] });
 
-  // Servera cache om den är färsk (undvik att hamra Dreamlo)
   const now = Date.now();
-  if (lastPayload && now - lastOkAt < COOLDOWN_MS) {
-    return res.status(200).json(lastPayload);
+
+  // färsk cache?
+  if (cache && now - cache.ts < CACHE_TTL_MS) {
+    return res.status(200).json({ ...cache.payload, cached: true });
   }
 
   try {
-    // Coalesce: om det redan pågår en hämtning, vänta på samma promise
-    if (!inflight) inflight = fetchDreamlo();
-    const result = await inflight;
-    inflight = null;
+    const json = await fetchDreamloJSON();
+    // normalisera -> { entries: [...] }
+    const entries = Array.isArray(json?.dreamlo?.leaderboard?.entry)
+      ? json.dreamlo.leaderboard.entry
+      : Array.isArray(json?.entries)
+      ? json.entries
+      : [];
 
-    if (result.ok) return res.status(200).json(result.payload);
-
-    // Soft-fail: ge senaste godkända payload, eller 200 med felinfo
-    if (lastPayload) return res.status(200).json(lastPayload);
-    return res.status(200).json({ error: "Dreamlo upstream error", detail: result.msg, entries: [] });
+    const payload = { updatedAt: new Date().toISOString(), entries };
+    cache = { ts: now, payload };
+    return res.status(200).json({ ...payload, cached: false });
   } catch (e: any) {
-    inflight = null;
-    if (lastPayload) return res.status(200).json(lastPayload);
-    return res.status(200).json({ error: "Unexpected error", detail: String(e?.message || e), entries: [] });
+    if (cache) {
+      // fallback till senaste lyckade
+      return res.status(200).json({ ...cache.payload, cached: true, note: "stale" });
+    }
+    return res.status(502).json({ error: "Dreamlo upstream error", detail: e?.message || String(e) });
   }
 }
