@@ -44,7 +44,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const hasSeconds = seconds !== undefined && Number.isFinite(Number(seconds)) && Number(seconds) >= 0;
     const encodedName = encodeURIComponent(cleanName);
 
-    const url = `https://www.dreamlo.com/lb/${DREAMLO_PRIVATE}/add/${encodedName}/${nScore}` + (hasSeconds ? `/${Number(seconds)}` : "");
+    // Use HTTP to support leaderboards without SSL
+    const url = `http://www.dreamlo.com/lb/${DREAMLO_PRIVATE}/add/${encodedName}/${nScore}` + (hasSeconds ? `/${Number(seconds)}` : "");
 
     const r = await fetch(url, { method: "GET", headers: { "User-Agent": "FastTap-Proxy/1.0" } });
     const text = await r.text();
