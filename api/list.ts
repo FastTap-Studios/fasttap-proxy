@@ -3,16 +3,14 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 const DREAMLO_PUBLIC = process.env.DREAMLO_PUBLIC_CODE as string;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-let cache: { ts: number; payload: any } | null = null;
-const TTL_MS = 30_000;
+// Cache + throttling (in-memory per server instance)
+let lastPayload: any | null = null;
+let lastOkAt = 0;
+let inflight: Promise<any> | null = null;
+let lastFetchStarted = 0;
+const COOLDOWN_MS = 1500; // Dreamlo tolererar inte samma request inom ~1s
 
-async function fetchText(url: string) {
-  const r = await fetch(url, { headers: { "User-Agent": "FastTap-Proxy/1.0" } });
-  const txt = await r.text();
-  return { ok: r.ok, txt, status: r.status };
-}
-
-function toPayloadFromDreamlo(json: any) {
+function payloadFromDreamlo(json: any) {
   const entries = json?.dreamlo?.leaderboard?.entry ?? [];
   return {
     updatedAt: new Date().toISOString(),
@@ -26,6 +24,37 @@ function toPayloadFromDreamlo(json: any) {
   };
 }
 
+async function fetchDreamlo() {
+  try {
+    // Cooldown: vänta om senaste start var nyss
+    const now = Date.now();
+    const wait = Math.max(0, COOLDOWN_MS - (now - lastFetchStarted));
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastFetchStarted = Date.now();
+
+    // Försök HTTPS, annars HTTP (vissa leaderboards har ej SSL)
+    const httpsUrl = `https://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`;
+    let r = await fetch(httpsUrl, { headers: { "User-Agent": "FastTap-Proxy/1.0" } });
+    let txt = await r.text();
+    let json: any;
+    try {
+      json = JSON.parse(txt);
+    } catch {
+      const httpUrl = `http://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`;
+      r = await fetch(httpUrl, { headers: { "User-Agent": "FastTap-Proxy/1.0" } });
+      txt = await r.text();
+      json = JSON.parse(txt);
+    }
+
+    const payload = payloadFromDreamlo(json);
+    lastPayload = payload;
+    lastOkAt = Date.now();
+    return { ok: true, payload };
+  } catch (e: any) {
+    return { ok: false, msg: String(e?.message || e) };
+  }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -33,37 +62,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Method Not Allowed" });
-  if (!DREAMLO_PUBLIC) return res.status(500).json({ error: "Server not configured" });
+  if (!DREAMLO_PUBLIC) return res.status(200).json({ error: "Server not configured", entries: [] });
+
+  // Servera cache om den är färsk (undvik att hamra Dreamlo)
+  const now = Date.now();
+  if (lastPayload && now - lastOkAt < COOLDOWN_MS) {
+    return res.status(200).json(lastPayload);
+  }
 
   try {
-    const now = Date.now();
-    if (cache && now - cache.ts < TTL_MS) return res.status(200).json(cache.payload);
+    // Coalesce: om det redan pågår en hämtning, vänta på samma promise
+    if (!inflight) inflight = fetchDreamlo();
+    const result = await inflight;
+    inflight = null;
 
-    // Try HTTPS first
-    const httpsUrl = `https://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`;
-    let { txt } = await fetchText(httpsUrl);
+    if (result.ok) return res.status(200).json(result.payload);
 
-    // If not valid JSON, try HTTP (some leaderboards don't have SSL enabled)
-    let json: any;
-    try {
-      json = JSON.parse(txt);
-    } catch {
-      const httpUrl = `http://www.dreamlo.com/lb/${DREAMLO_PUBLIC}/json`;
-      const r2 = await fetchText(httpUrl);
-      try {
-        json = JSON.parse(r2.txt);
-      } catch {
-        return res.status(502).json({
-          error: "Dreamlo upstream error",
-          detail: r2.txt,
-        });
-      }
-    }
-
-    const payload = toPayloadFromDreamlo(json);
-    cache = { ts: Date.now(), payload };
-    return res.status(200).json(payload);
+    // Soft-fail: ge senaste godkända payload, eller 200 med felinfo
+    if (lastPayload) return res.status(200).json(lastPayload);
+    return res.status(200).json({ error: "Dreamlo upstream error", detail: result.msg, entries: [] });
   } catch (e: any) {
-    return res.status(502).json({ error: "Dreamlo upstream error", detail: e?.message });
+    inflight = null;
+    if (lastPayload) return res.status(200).json(lastPayload);
+    return res.status(200).json({ error: "Unexpected error", detail: String(e?.message || e), entries: [] });
   }
 }
